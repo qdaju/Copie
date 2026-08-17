@@ -6,7 +6,7 @@ project_root = Path(defines.get("project_root", Path.cwd())).resolve()
 format = "UDZO"
 filesystem = "HFS+"
 files = [
-    str(project_root / "dist/Copie-1.0.xcarchive/Products/Applications/Copie.app"),
+    str(project_root / "dist/Copie-1.1.xcarchive/Products/Applications/Copie.app"),
 ]
 symlinks = {"应用程序": "/Applications"}
 

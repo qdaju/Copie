@@ -23,6 +23,7 @@ private enum AppLanguage: String {
 
 private enum CopieSettings {
     static let holdDurationKey = "selectAllHoldDuration"
+    static let selectAllEnabledKey = "selectAllEnabled"
     static let defaultHoldDuration: TimeInterval = 0.5
     static let minimumHoldDuration: TimeInterval = 0.2
     static let maximumHoldDuration: TimeInterval = 2.0
@@ -37,6 +38,15 @@ private enum CopieSettings {
             maximumHoldDuration
         )
     }
+
+    static var isSelectAllEnabled: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: selectAllEnabledKey) != nil else {
+            return true
+        }
+        return defaults.bool(forKey: selectAllEnabledKey)
+    }
+
 }
 
 private final class HoldDurationSlider: NSSlider {
@@ -113,11 +123,14 @@ private final class RollingValueLabel: NSTextField {
 
 // MARK: - App entry
 @main
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let tap = EventTap()
     private var statusItem: NSStatusItem!
     private var autoLaunchItem: NSMenuItem!
     private weak var holdDurationValueLabel: RollingValueLabel?
+    private var featureGuidePanel: NSPanel?
+    private var shouldPresentFeatureGuideAfterMenuCloses = false
+    private var featureGuidePresentationWorkItem: DispatchWorkItem?
     private var language: AppLanguage = {
         guard let rawValue = UserDefaults.standard.string(forKey: "appLanguage"),
               let savedLanguage = AppLanguage(rawValue: rawValue) else { return .chinese }
@@ -130,6 +143,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // ② 创建菜单栏图标
         prepareStatusItem()
+
+        #if DEBUG
+        if CommandLine.arguments.contains("--show-feature-guide") {
+            DispatchQueue.main.async { [weak self] in
+                self?.showFeatureGuide(NSMenuItem())
+            }
+        }
+        #endif
     }
 
     // MARK: - 权限
@@ -200,8 +221,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 菜单栏下拉
     private func buildMenu() -> NSMenu {
         let m = NSMenu()
+        m.delegate = self
 
         m.addItem(makeHoldDurationMenuItem())
+        let selectAllItem = NSMenuItem(
+            title: localized(chinese: "输入框长按全选", english: "Hold to Select All in Text Fields"),
+            action: #selector(toggleSelectAll(_:)),
+            keyEquivalent: ""
+        )
+        selectAllItem.target = self
+        selectAllItem.state = CopieSettings.isSelectAllEnabled ? .on : .off
+        m.addItem(selectAllItem)
         m.addItem(.separator())
 
         // 开机自启菜单项
@@ -214,7 +244,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoLaunchItem.state = isLaunchAtLoginEnabled ? .on : .off
         m.addItem(autoLaunchItem)
 
-        m.addItem(withTitle: localized(chinese: "功能说明", english: "Features"), action: #selector(showFeatureGuide(_:)), keyEquivalent: "")
+        let featureGuideItem = NSMenuItem(
+            title: localized(chinese: "功能说明", english: "Features"),
+            action: #selector(showFeatureGuide(_:)),
+            keyEquivalent: ""
+        )
+        featureGuideItem.target = self
+        m.addItem(featureGuideItem)
 
         let languageMenu = NSMenu()
         let chineseItem = NSMenuItem(title: "中文", action: #selector(changeLanguage(_:)), keyEquivalent: "")
@@ -289,21 +325,280 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    @objc private func toggleSelectAll(_ sender: NSMenuItem) {
+        let isEnabled = !CopieSettings.isSelectAllEnabled
+        UserDefaults.standard.set(isEnabled, forKey: CopieSettings.selectAllEnabledKey)
+        sender.state = isEnabled ? .on : .off
+        tap.setSelectAllEnabled(isEnabled)
+    }
+
     private func formattedHoldDuration(_ value: TimeInterval) -> String {
         let number = String(format: "%.1f", value)
         return language == .chinese ? "\(number) 秒" : "\(number) s"
     }
 
     @objc private func showFeatureGuide(_ sender: NSMenuItem) {
-        let alert = NSAlert()
-        alert.messageText = localized(chinese: "Copie 功能说明", english: "Copie Features")
-        let duration = String(format: "%.1f", CopieSettings.holdDuration)
-        alert.informativeText = localized(
-            chinese: "触发时长滑杆：支持左键拖动或悬停后滚动滚轮\n\n左键长按 \(duration) 秒且鼠标不移动：执行全选\n\n左键拖动选中文字后点击右键：快速复制\n\n点击鼠标中键：粘贴\n\n登录时启动：设置是否登录时自动启动 Copie",
-            english: "Trigger duration slider: Drag it or hover and use the scroll wheel\n\nHold the left mouse button for \(duration) seconds without moving: Select All\n\nDrag to select text, then right-click: Quick Copy\n\nClick the middle mouse button: Paste\n\nLaunch at Login: Start Copie automatically when you log in"
+        if featureGuidePanel == nil {
+            let duration = String(format: "%.1f", CopieSettings.holdDuration)
+            featureGuidePanel = makeFeatureGuidePanel(duration: duration)
+        }
+
+        if sender.menu != nil {
+            shouldPresentFeatureGuideAfterMenuCloses = true
+            // menuDidClose is normally immediate, but keep a short fallback for
+            // cases where menu tracking ends without delivering the delegate call.
+            scheduleFeatureGuidePresentation(after: 0.12)
+        } else if let panel = featureGuidePanel {
+            presentFeatureGuidePanel(panel)
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard shouldPresentFeatureGuideAfterMenuCloses else { return }
+        shouldPresentFeatureGuideAfterMenuCloses = false
+        scheduleFeatureGuidePresentation(after: 0)
+    }
+
+    private func scheduleFeatureGuidePresentation(after delay: TimeInterval) {
+        featureGuidePresentationWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, let panel = self.featureGuidePanel else { return }
+            self.shouldPresentFeatureGuideAfterMenuCloses = false
+            self.presentFeatureGuidePanel(panel)
+        }
+        featureGuidePresentationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func makeFeatureGuidePanel(duration: String) -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 420),
+            styleMask: [.titled, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
         )
-        alert.addButton(withTitle: localized(chinese: "知道了", english: "Got it"))
-        alert.runModal()
+        panel.titleVisibility = .hidden
+        panel.titlebarAppearsTransparent = true
+        panel.isMovableByWindowBackground = true
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.collectionBehavior = [.transient, .moveToActiveSpace]
+        panel.animationBehavior = .none
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+
+        let background = NSVisualEffectView()
+        background.material = .popover
+        background.blendingMode = .behindWindow
+        background.state = .active
+        panel.contentView = background
+
+        let appIcon = NSImageView(image: NSApplication.shared.applicationIconImage)
+        appIcon.translatesAutoresizingMaskIntoConstraints = false
+
+        let heading = NSTextField(
+            labelWithString: localized(chinese: "Copie 功能说明", english: "Copie Features")
+        )
+        heading.font = .systemFont(ofSize: 15, weight: .semibold)
+        heading.alignment = .center
+        heading.translatesAutoresizingMaskIntoConstraints = false
+
+        let features = makeFeatureGuideView(duration: duration)
+        features.translatesAutoresizingMaskIntoConstraints = false
+
+        let closeButton = NSButton(
+            title: localized(chinese: "知道了", english: "Got it"),
+            target: self,
+            action: #selector(dismissFeatureGuide(_:))
+        )
+        closeButton.bezelStyle = .rounded
+        closeButton.controlSize = .large
+        closeButton.keyEquivalent = "\r"
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+
+        [appIcon, heading, features, closeButton].forEach(background.addSubview)
+        NSLayoutConstraint.activate([
+            appIcon.topAnchor.constraint(equalTo: background.topAnchor, constant: 26),
+            appIcon.centerXAnchor.constraint(equalTo: background.centerXAnchor),
+            appIcon.widthAnchor.constraint(equalToConstant: 58),
+            appIcon.heightAnchor.constraint(equalToConstant: 58),
+
+            heading.topAnchor.constraint(equalTo: appIcon.bottomAnchor, constant: 12),
+            heading.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 20),
+            heading.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -20),
+
+            features.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 18),
+            features.centerXAnchor.constraint(equalTo: background.centerXAnchor),
+            features.widthAnchor.constraint(equalToConstant: 360),
+            features.heightAnchor.constraint(equalToConstant: 220),
+
+            closeButton.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 20),
+            closeButton.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -20),
+            closeButton.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -18),
+            closeButton.heightAnchor.constraint(equalToConstant: 34)
+        ])
+        return panel
+    }
+
+    private func presentFeatureGuidePanel(_ panel: NSPanel) {
+        guard featureGuidePanel === panel else { return }
+
+        NSApp.activate(ignoringOtherApps: true)
+        panel.center()
+
+        if panel.isVisible {
+            panel.alphaValue = 1
+            panel.makeKeyAndOrderFront(nil)
+            panel.orderFrontRegardless()
+            return
+        }
+
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            panel.alphaValue = 1
+            panel.makeKeyAndOrderFront(nil)
+            panel.orderFrontRegardless()
+            return
+        }
+
+        let finalFrame = panel.frame
+        var initialFrame = finalFrame
+        initialFrame.origin.y -= 8
+        panel.alphaValue = 0
+        panel.setFrame(initialFrame, display: false)
+        panel.makeKeyAndOrderFront(nil)
+        panel.orderFrontRegardless()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.24
+            context.timingFunction = CAMediaTimingFunction(
+                controlPoints: 0.22,
+                0.80,
+                0.20,
+                1.00
+            )
+            panel.animator().alphaValue = 1
+            panel.animator().setFrame(finalFrame, display: true)
+        }
+    }
+
+    @objc private func dismissFeatureGuide(_ sender: NSButton) {
+        guard let panel = featureGuidePanel else { return }
+
+        featureGuidePresentationWorkItem?.cancel()
+        shouldPresentFeatureGuideAfterMenuCloses = false
+        // Release ownership immediately so a fast subsequent menu click creates a
+        // fresh panel instead of reviving one whose close animation is still running.
+        featureGuidePanel = nil
+
+        let finish = { [weak panel] in
+            panel?.orderOut(nil)
+            panel?.alphaValue = 1
+        }
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            finish()
+            return
+        }
+
+        var finalFrame = panel.frame
+        finalFrame.origin.y -= 6
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            panel.animator().alphaValue = 0
+            panel.animator().setFrame(finalFrame, display: true)
+        } completionHandler: {
+            finish()
+        }
+    }
+
+    private func makeFeatureGuideView(duration: String) -> NSView {
+        let features: [(symbol: String, title: String, detail: String)] = [
+            (
+                "slider.horizontal.3",
+                localized(chinese: "调整触发时长", english: "Adjust Trigger Duration"),
+                localized(chinese: "拖动滑杆，或悬停后滚动滚轮。", english: "Drag the slider, or hover and use the scroll wheel.")
+            ),
+            (
+                "text.cursor",
+                localized(chinese: "输入框长按全选", english: "Hold to Select All"),
+                localized(
+                    chinese: "在菜单中开启后，在输入框内按住左键 \(duration) 秒并保持不动，即可全选。",
+                    english: "Enable it in the menu, then hold still in a text field for \(duration) seconds to select all."
+                )
+            ),
+            (
+                "doc.on.doc",
+                localized(chinese: "右键快速复制", english: "Right-click to Copy"),
+                localized(chinese: "拖动选中文字，然后点击右键。", english: "Select text by dragging, then right-click.")
+            ),
+            (
+                "clipboard",
+                localized(chinese: "中键粘贴", english: "Middle-click to Paste"),
+                localized(chinese: "点击鼠标中键，粘贴剪贴板内容。", english: "Click the middle mouse button to paste.")
+            ),
+            (
+                "power",
+                localized(chinese: "登录时启动", english: "Launch at Login"),
+                localized(chinese: "可随时在菜单中开启或关闭。", english: "Turn it on or off from the menu.")
+            )
+        ]
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 220))
+        let featureStack = NSStackView()
+        featureStack.orientation = .vertical
+        featureStack.alignment = .leading
+        featureStack.spacing = 10
+        featureStack.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(featureStack)
+
+        for feature in features {
+            let icon = NSImageView()
+            icon.image = NSImage(
+                systemSymbolName: feature.symbol,
+                accessibilityDescription: feature.title
+            )
+            icon.contentTintColor = .controlAccentColor
+            icon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+            icon.translatesAutoresizingMaskIntoConstraints = false
+
+            let title = NSTextField(labelWithString: feature.title)
+            title.font = .systemFont(ofSize: 13, weight: .semibold)
+            title.textColor = .labelColor
+
+            let detail = NSTextField(wrappingLabelWithString: feature.detail)
+            detail.font = .systemFont(ofSize: 11.5, weight: .regular)
+            detail.textColor = .secondaryLabelColor
+            detail.maximumNumberOfLines = 2
+
+            let textStack = NSStackView(views: [title, detail])
+            textStack.orientation = .vertical
+            textStack.alignment = .leading
+            textStack.spacing = 2
+
+            let row = NSStackView(views: [icon, textStack])
+            row.orientation = .horizontal
+            row.alignment = .top
+            row.spacing = 11
+            featureStack.addArrangedSubview(row)
+
+            NSLayoutConstraint.activate([
+                icon.widthAnchor.constraint(equalToConstant: 20),
+                icon.heightAnchor.constraint(equalToConstant: 20),
+                textStack.widthAnchor.constraint(equalToConstant: 329)
+            ])
+        }
+
+        NSLayoutConstraint.activate([
+            featureStack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            featureStack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            featureStack.topAnchor.constraint(equalTo: container.topAnchor, constant: 4),
+            featureStack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor)
+        ])
+        return container
     }
 
     @objc private func changeLanguage(_ sender: NSMenuItem) {
@@ -531,6 +826,12 @@ final class EventTap {
         CGEvent.tapEnable(tap: tap, enable: true)
     }
 
+    func setSelectAllEnabled(_ isEnabled: Bool) {
+        guard !isEnabled else { return }
+        cancelSelectAll()
+        selectAllTriggered = false
+    }
+
     // 返回 true = 继续给系统；false = 吞掉
     private func handle(event: CGEvent, type: CGEventType) -> Bool {
         // macOS disables slow event taps. Re-enable immediately so the app does
@@ -564,7 +865,9 @@ final class EventTap {
             leftMouseDownLocation = event.location
             leftMouseHeld = true
             selectAllTriggered = false
-            scheduleSelectAll()
+            if CopieSettings.isSelectAllEnabled {
+                scheduleSelectAll()
+            }
             return true
 
         case .leftMouseDragged:               // 拖动选择中
@@ -621,14 +924,196 @@ final class EventTap {
             guard let self,
                   self.longPressGeneration == generation,
                   self.leftMouseHeld,
-                  !self.selectAllTriggered else { return }
+                  !self.selectAllTriggered,
+                  CopieSettings.isSelectAllEnabled else { return }
+
+            self.longPressWorkItem = nil
+            guard let location = self.leftMouseDownLocation,
+                  self.isEditableTextInput(at: location) else { return }
 
             self.selectAllTriggered = true
-            self.longPressWorkItem = nil
             self.releaseMouseAndSelectAll()
         }
         longPressWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + selectAllHoldDuration, execute: workItem)
+    }
+
+    private func isEditableTextInput(at location: CGPoint) -> Bool {
+        let systemWideElement = AXUIElementCreateSystemWide()
+        var hitElement: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(
+            systemWideElement,
+            Float(location.x),
+            Float(location.y),
+            &hitElement
+        ) == .success,
+        let hitElement else {
+            return isWeChatTextInput(at: location)
+        }
+
+        var currentElement: AXUIElement? = hitElement
+        for _ in 0..<8 {
+            guard let element = currentElement else { break }
+
+            if isEditableTextInput(element) {
+                return true
+            }
+
+            var parentValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                element,
+                kAXParentAttribute as CFString,
+                &parentValue
+            ) == .success,
+            let parentValue,
+            CFGetTypeID(parentValue) == AXUIElementGetTypeID() else { break }
+
+            currentElement = unsafeBitCast(parentValue, to: AXUIElement.self)
+        }
+        return isWeChatTextInput(at: location)
+    }
+
+    /// WeChat 4.x draws its search field and chat composer itself and returns
+    /// `kAXErrorNotImplemented` for element-at-position queries. Its top-level
+    /// window geometry is still exposed, so narrowly recognize only those two
+    /// editable areas in the frontmost WeChat window.
+    private func isWeChatTextInput(at location: CGPoint) -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier == "com.tencent.xinWeChat" else { return false }
+
+        let appElement = AXUIElementCreateApplication(app.processIdentifier)
+        let windows: [AXUIElement]
+        var focusedWindowValue: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedWindowAttribute as CFString,
+            &focusedWindowValue
+        ) == .success,
+        let focusedWindowValue,
+        CFGetTypeID(focusedWindowValue) == AXUIElementGetTypeID() {
+            windows = [unsafeBitCast(focusedWindowValue, to: AXUIElement.self)]
+        } else {
+            var windowsValue: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                appElement,
+                kAXWindowsAttribute as CFString,
+                &windowsValue
+            ) == .success,
+            let allWindows = windowsValue as? [AXUIElement] else { return false }
+            windows = allWindows
+        }
+
+        for window in windows {
+            guard let frame = frame(of: window),
+                  frame.width > 500,
+                  frame.height > 400,
+                  frame.contains(location) else { continue }
+
+            let windowTitle = stringAttribute(kAXTitleAttribute, of: window) ?? ""
+            if windowTitle == "微信 (窗口)" {
+                let navigationSearchField = CGRect(
+                    x: frame.minX + frame.width * 0.165,
+                    y: frame.minY + 3,
+                    width: frame.width * 0.22,
+                    height: 38
+                )
+                let pageSearchField = CGRect(
+                    x: frame.minX + frame.width * 0.085,
+                    y: frame.minY + 60,
+                    width: frame.width * 0.56,
+                    height: 50
+                )
+                return navigationSearchField.contains(location)
+                    || pageSearchField.contains(location)
+            }
+
+            guard windowTitle == "微信" else { return false }
+            let leftPanelsWidth = min(300, frame.width * 0.38)
+            let composerHeight = min(150, frame.height * 0.24)
+            let bottomToolbarHeight: CGFloat = 38
+            let isInComposer = location.x >= frame.minX + leftPanelsWidth
+                && location.y >= frame.maxY - composerHeight
+                && location.y <= frame.maxY - bottomToolbarHeight
+            let searchField = CGRect(
+                x: frame.minX + 65,
+                y: frame.minY + 8,
+                width: min(195, frame.width * 0.25),
+                height: 40
+            )
+            return isInComposer || searchField.contains(location)
+        }
+        return false
+    }
+
+    private func frame(of element: AXUIElement) -> CGRect? {
+        var rawPosition: CFTypeRef?
+        var rawSize: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXPositionAttribute as CFString,
+            &rawPosition
+        ) == .success,
+        AXUIElementCopyAttributeValue(
+            element,
+            kAXSizeAttribute as CFString,
+            &rawSize
+        ) == .success,
+        let rawPosition,
+        let rawSize,
+        CFGetTypeID(rawPosition) == AXValueGetTypeID(),
+        CFGetTypeID(rawSize) == AXValueGetTypeID() else { return nil }
+
+        let positionValue = unsafeBitCast(rawPosition, to: AXValue.self)
+        let sizeValue = unsafeBitCast(rawSize, to: AXValue.self)
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: position, size: size)
+    }
+
+    private func isEditableTextInput(_ element: AXUIElement) -> Bool {
+        guard let role = stringAttribute(kAXRoleAttribute, of: element) else { return false }
+        let textRoles = [
+            kAXTextFieldRole as String,
+            kAXTextAreaRole as String,
+            kAXComboBoxRole as String
+        ]
+        let isSearchField = stringAttribute(kAXSubroleAttribute, of: element) == "AXSearchField"
+        guard textRoles.contains(role) || isSearchField else { return false }
+
+        if let enabled = boolAttribute(kAXEnabledAttribute, of: element), !enabled {
+            return false
+        }
+
+        for attribute in [kAXValueAttribute, kAXSelectedTextRangeAttribute] {
+            var settable = DarwinBoolean(false)
+            if AXUIElementIsAttributeSettable(
+                element,
+                attribute as CFString,
+                &settable
+            ) == .success,
+            settable.boolValue {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func stringAttribute(_ attribute: String, of element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? String
+    }
+
+    private func boolAttribute(_ attribute: String, of element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+            return nil
+        }
+        return value as? Bool
     }
 
     private func releaseMouseAndSelectAll() {

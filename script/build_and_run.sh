@@ -21,6 +21,11 @@ xcodebuild \
   CODE_SIGNING_ALLOWED=NO \
   build
 
+# LaunchServices can reject Xcode's linker-signed Debug bundle because its
+# resources and Info.plist are not sealed. Apply a complete local ad-hoc
+# signature so the development app opens like the packaged build.
+codesign --force --deep --sign - "$APP_BUNDLE"
+
 open_app() {
   /usr/bin/open -n "$APP_BUNDLE"
 }
