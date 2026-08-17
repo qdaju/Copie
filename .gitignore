@@ -6,6 +6,7 @@
 # Xcode user data and build products
 build/
 DerivedData/
+dist/
 *.xcuserstate
 xcuserdata/
 *.xccheckout
@@ -22,7 +23,7 @@ Package.resolved
 # Fastlane / local environment
 fastlane/report.xml
 fastlane/Preview.html
+.codex/
 .env
 .env.*
 !.env.example
-

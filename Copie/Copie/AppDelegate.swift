@@ -1,6 +1,7 @@
 import Cocoa
 import ApplicationServices
 import ServiceManagement   // 新增
+import QuartzCore
 
 // MARK: - Parallels Desktop detection
 private let parallelsBundlePrefixes: [String] = [
@@ -15,12 +16,113 @@ func isParallelsFrontmost() -> Bool {
     return parallelsBundlePrefixes.contains { id.hasPrefix($0) }
 }
 
+private enum AppLanguage: String {
+    case chinese = "zh"
+    case english = "en"
+}
+
+private enum CopieSettings {
+    static let holdDurationKey = "selectAllHoldDuration"
+    static let defaultHoldDuration: TimeInterval = 0.5
+    static let minimumHoldDuration: TimeInterval = 0.2
+    static let maximumHoldDuration: TimeInterval = 2.0
+
+    static var holdDuration: TimeInterval {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: holdDurationKey) != nil else {
+            return defaultHoldDuration
+        }
+        return Swift.min(
+            Swift.max(defaults.double(forKey: holdDurationKey), minimumHoldDuration),
+            maximumHoldDuration
+        )
+    }
+}
+
+private final class HoldDurationSlider: NSSlider {
+    private var dragStartValue: Double?
+    private var isMouseDragging = false
+
+    override func mouseDown(with event: NSEvent) {
+        dragStartValue = doubleValue
+        isMouseDragging = true
+        super.mouseDown(with: event)
+        isMouseDragging = false
+        dragStartValue = nil
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        let delta = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
+            ? event.scrollingDeltaY
+            : event.scrollingDeltaX
+        guard delta != 0 else { return }
+
+        let direction = delta > 0 ? 1.0 : -1.0
+        let nextValue = Swift.min(
+            Swift.max(doubleValue + direction * 0.1, minValue),
+            maxValue
+        )
+        guard nextValue != doubleValue else { return }
+
+        doubleValue = nextValue
+        _ = sendAction(action, to: target)
+    }
+
+    override func sendAction(_ action: Selector?, to target: Any?) -> Bool {
+        if isMouseDragging,
+           let startValue = dragStartValue,
+           abs(doubleValue - startValue) > 0.0001 {
+            let roundedValue = (doubleValue * 10).rounded() / 10
+            if abs(roundedValue - startValue) < 0.0001 {
+                doubleValue = Swift.min(
+                    Swift.max(startValue + (doubleValue > startValue ? 0.1 : -0.1), minValue),
+                    maxValue
+                )
+            }
+        }
+        return super.sendAction(action, to: target)
+    }
+}
+
+private final class RollingValueLabel: NSTextField {
+    private var displayedValue: Double?
+
+    func update(value: Double, text: String, animated: Bool = true) {
+        guard let previousValue = displayedValue else {
+            displayedValue = value
+            stringValue = text
+            wantsLayer = true
+            layer?.masksToBounds = true
+            return
+        }
+        guard abs(value - previousValue) > 0.0001 else { return }
+
+        if animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let transition = CATransition()
+            transition.type = .push
+            transition.subtype = value > previousValue ? .fromBottom : .fromTop
+            transition.duration = 0.16
+            transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer?.add(transition, forKey: "rollingValue")
+        }
+
+        displayedValue = value
+        stringValue = text
+    }
+}
+
 // MARK: - App entry
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
     private let tap = EventTap()
     private var statusItem: NSStatusItem!
     private var autoLaunchItem: NSMenuItem!
+    private weak var holdDurationValueLabel: RollingValueLabel?
+    private var language: AppLanguage = {
+        guard let rawValue = UserDefaults.standard.string(forKey: "appLanguage"),
+              let savedLanguage = AppLanguage(rawValue: rawValue) else { return .chinese }
+        return savedLanguage
+    }()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // ① 先检查 / 触发辅助功能权限；拿到权限后再启动 EventTap
@@ -61,10 +163,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func showAccessibilityAlert() {
         DispatchQueue.main.async {
             let alert = NSAlert()
-            alert.messageText = "Copie 需要“辅助功能”权限"
-            alert.informativeText = "请点击“打开设置”，然后在左侧“辅助功能”里把 Copie 的开关打开。完成后返回 Copie 即可正常使用。"
-            alert.addButton(withTitle: "打开设置")
-            alert.addButton(withTitle: "稍后再说")
+            alert.messageText = self.localized(chinese: "Copie 需要“辅助功能”权限", english: "Copie needs Accessibility permission")
+            alert.informativeText = self.localized(
+                chinese: "请点击“打开设置”，然后在左侧“辅助功能”里把 Copie 的开关打开。完成后返回 Copie 即可正常使用。",
+                english: "Click “Open Settings”, enable Copie under Accessibility, then return to Copie to continue."
+            )
+            alert.addButton(withTitle: self.localized(chinese: "打开设置", english: "Open Settings"))
+            alert.addButton(withTitle: self.localized(chinese: "稍后再说", english: "Later"))
 
             if alert.runModal() == .alertFirstButtonReturn,
                let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
@@ -78,11 +183,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
         if let btn = statusItem.button {
-            btn.image = NSImage(
-                systemSymbolName: "doc.on.clipboard.fill",
+            let icon = NSImage(named: "MenuBarIcon") ?? NSImage(
+                systemSymbolName: "c.circle.fill",
                 accessibilityDescription: "Copie"
-            ) ?? NSImage(named: "FallbackTemplate")          // 兜底图片
-            btn.image?.isTemplate = true
+            )
+            icon?.size = NSSize(width: 18, height: 18)
+            icon?.isTemplate = true
+            icon?.accessibilityDescription = "Copie"
+            btn.image = icon
+            btn.imagePosition = .imageOnly
+            btn.toolTip = "Copie"
         }
         statusItem.menu = buildMenu()
     }
@@ -91,9 +201,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildMenu() -> NSMenu {
         let m = NSMenu()
 
+        m.addItem(makeHoldDurationMenuItem())
+        m.addItem(.separator())
+
         // 开机自启菜单项
         autoLaunchItem = NSMenuItem(
-            title: "Launch at Login",
+            title: localized(chinese: "登录时启动", english: "Launch at Login"),
             action: #selector(toggleLaunchAtLogin(_:)),
             keyEquivalent: ""
         )
@@ -101,9 +214,108 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         autoLaunchItem.state = isLaunchAtLoginEnabled ? .on : .off
         m.addItem(autoLaunchItem)
 
+        m.addItem(withTitle: localized(chinese: "功能说明", english: "Features"), action: #selector(showFeatureGuide(_:)), keyEquivalent: "")
+
+        let languageMenu = NSMenu()
+        let chineseItem = NSMenuItem(title: "中文", action: #selector(changeLanguage(_:)), keyEquivalent: "")
+        chineseItem.representedObject = AppLanguage.chinese.rawValue
+        chineseItem.state = language == .chinese ? .on : .off
+        chineseItem.target = self
+        languageMenu.addItem(chineseItem)
+
+        let englishItem = NSMenuItem(title: "English", action: #selector(changeLanguage(_:)), keyEquivalent: "")
+        englishItem.representedObject = AppLanguage.english.rawValue
+        englishItem.state = language == .english ? .on : .off
+        englishItem.target = self
+        languageMenu.addItem(englishItem)
+
+        let languageItem = NSMenuItem(title: "语言 / Language", action: nil, keyEquivalent: "")
+        languageItem.submenu = languageMenu
+        m.addItem(languageItem)
+
         m.addItem(.separator())
-        m.addItem(withTitle: "Quit Copie", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit Copie", action: #selector(quitCopie(_:)), keyEquivalent: "q")
+        quitItem.target = self
+        m.addItem(quitItem)
         return m
+    }
+
+    @objc private func quitCopie(_ sender: NSMenuItem) {
+        NSApp.terminate(sender)
+    }
+
+    private func makeHoldDurationMenuItem() -> NSMenuItem {
+        let menuItem = NSMenuItem()
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 62))
+
+        let titleLabel = NSTextField(labelWithString: localized(chinese: "触发时长", english: "Trigger Duration"))
+        titleLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        titleLabel.frame = NSRect(x: 14, y: 36, width: 170, height: 18)
+        container.addSubview(titleLabel)
+
+        let valueLabel = RollingValueLabel(labelWithString: "")
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        valueLabel.alignment = .right
+        valueLabel.frame = NSRect(x: 190, y: 36, width: 76, height: 18)
+        valueLabel.update(
+            value: CopieSettings.holdDuration,
+            text: formattedHoldDuration(CopieSettings.holdDuration),
+            animated: false
+        )
+        container.addSubview(valueLabel)
+        holdDurationValueLabel = valueLabel
+
+        let slider = HoldDurationSlider(frame: .zero)
+        slider.doubleValue = CopieSettings.holdDuration
+        slider.minValue = CopieSettings.minimumHoldDuration
+        slider.maxValue = CopieSettings.maximumHoldDuration
+        slider.target = self
+        slider.action = #selector(changeHoldDuration(_:))
+        slider.isContinuous = true
+        slider.frame = NSRect(x: 12, y: 7, width: 256, height: 24)
+        container.addSubview(slider)
+
+        menuItem.view = container
+        return menuItem
+    }
+
+    @objc private func changeHoldDuration(_ sender: NSSlider) {
+        let roundedValue = (sender.doubleValue * 10).rounded() / 10
+        sender.doubleValue = roundedValue
+        UserDefaults.standard.set(roundedValue, forKey: CopieSettings.holdDurationKey)
+        holdDurationValueLabel?.update(
+            value: roundedValue,
+            text: formattedHoldDuration(roundedValue)
+        )
+    }
+
+    private func formattedHoldDuration(_ value: TimeInterval) -> String {
+        let number = String(format: "%.1f", value)
+        return language == .chinese ? "\(number) 秒" : "\(number) s"
+    }
+
+    @objc private func showFeatureGuide(_ sender: NSMenuItem) {
+        let alert = NSAlert()
+        alert.messageText = localized(chinese: "Copie 功能说明", english: "Copie Features")
+        let duration = String(format: "%.1f", CopieSettings.holdDuration)
+        alert.informativeText = localized(
+            chinese: "触发时长滑杆：支持左键拖动或悬停后滚动滚轮\n\n左键长按 \(duration) 秒且鼠标不移动：执行全选\n\n左键拖动选中文字后点击右键：快速复制\n\n点击鼠标中键：粘贴\n\n登录时启动：设置是否登录时自动启动 Copie",
+            english: "Trigger duration slider: Drag it or hover and use the scroll wheel\n\nHold the left mouse button for \(duration) seconds without moving: Select All\n\nDrag to select text, then right-click: Quick Copy\n\nClick the middle mouse button: Paste\n\nLaunch at Login: Start Copie automatically when you log in"
+        )
+        alert.addButton(withTitle: localized(chinese: "知道了", english: "Got it"))
+        alert.runModal()
+    }
+
+    @objc private func changeLanguage(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let selectedLanguage = AppLanguage(rawValue: rawValue) else { return }
+        language = selectedLanguage
+        UserDefaults.standard.set(selectedLanguage.rawValue, forKey: "appLanguage")
+        statusItem.menu = buildMenu()
+    }
+
+    private func localized(chinese: String, english: String) -> String {
+        language == .chinese ? chinese : english
     }
 
     // 检查是否开机自启
@@ -127,10 +339,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 sender.state = appService.status == .enabled ? .on : .off
             } catch {
-                Notifier.shared.show(text: "切换自启失败：\(error.localizedDescription)")
+                let prefix = localized(chinese: "切换登录时启动失败：", english: "Could not change Launch at Login: ")
+                Notifier.shared.show(text: prefix + error.localizedDescription)
             }
         } else {
-            Notifier.shared.show(text: "当前系统不支持自动开机（需要 macOS 13+）")
+            Notifier.shared.show(text: localized(chinese: "当前系统不支持登录时启动（需要 macOS 13+）", english: "Launch at Login requires macOS 13 or later"))
         }
     }
 }
@@ -187,6 +400,8 @@ final class CopieActions {
     }
 
     func performPaste() { sendShortcut(0x09) } // 'v'
+
+    func performSelectAll() { sendShortcut(0x00) } // 'a'
 }
 
 // MARK: - HUD 提示
@@ -276,14 +491,24 @@ final class Notifier {
 
 // MARK: - 全局鼠标监听
 final class EventTap {
+    private var selectAllHoldDuration: TimeInterval { CopieSettings.holdDuration }
+    private let syntheticMouseEventTag: Int64 = 0x434F504945
     private var tap: CFMachPort?
     private var quickCopyArmed = false   // 下一次右键是否触发快速复制
     private var armedAt: CFTimeInterval = 0
+    private var leftMouseDownLocation: CGPoint?
+    private var leftMouseHeld = false
+    private var selectAllTriggered = false
+    private var longPressWorkItem: DispatchWorkItem?
+    private var longPressGeneration = 0
+    private var suppressPhysicalLeftMouseUp = false
+    private var mouseSuppressionGeneration = 0
 
     func start() {
-        // 监控：拖选、右键、鼠标中键
+        // 监控：左键长按/拖选、右键、鼠标中键
         let mask: CGEventMask =
             (1 << CGEventType.leftMouseDown.rawValue)    |
+            (1 << CGEventType.leftMouseUp.rawValue)      |
             (1 << CGEventType.leftMouseDragged.rawValue) |
             (1 << CGEventType.rightMouseDown.rawValue)  |
             (1 << CGEventType.rightMouseUp.rawValue)    |
@@ -315,6 +540,20 @@ final class EventTap {
             return true
         }
 
+        // Pass through the synthetic mouse-up generated by the long-press
+        // gesture, then suppress the matching physical drag/up events.
+        if type == .leftMouseUp,
+           event.getIntegerValueField(.eventSourceUserData) == syntheticMouseEventTag {
+            return true
+        }
+        if suppressPhysicalLeftMouseUp {
+            if type == .leftMouseDown || type == .leftMouseDragged { return false }
+            if type == .leftMouseUp {
+                clearPhysicalMouseSuppression()
+                return false
+            }
+        }
+
         // 如果前台是 Parallels Desktop，完全放行，避免拦截其快捷键
         if isParallelsFrontmost() { return true }
 
@@ -322,11 +561,25 @@ final class EventTap {
 
         case .leftMouseDown:
             quickCopyArmed = false
+            leftMouseDownLocation = event.location
+            leftMouseHeld = true
+            selectAllTriggered = false
+            scheduleSelectAll()
             return true
 
         case .leftMouseDragged:               // 拖动选择中
-            quickCopyArmed = true
-            armedAt = CACurrentMediaTime()
+            guard let downLocation = leftMouseDownLocation else { return true }
+            if hasMouseMoved(from: downLocation, to: event.location) {
+                cancelSelectAll()
+                quickCopyArmed = true
+                armedAt = CACurrentMediaTime()
+            }
+            return true
+
+        case .leftMouseUp:
+            cancelSelectAll()
+            leftMouseHeld = false
+            leftMouseDownLocation = nil
             return true
 
         case .rightMouseDown:
@@ -353,5 +606,86 @@ final class EventTap {
         default:
             return true
         }
+    }
+
+    private func hasMouseMoved(from start: CGPoint, to current: CGPoint) -> Bool {
+        abs(current.x - start.x) > 0.5 || abs(current.y - start.y) > 0.5
+    }
+
+    private func scheduleSelectAll() {
+        longPressWorkItem?.cancel()
+        longPressGeneration += 1
+        let generation = longPressGeneration
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.longPressGeneration == generation,
+                  self.leftMouseHeld,
+                  !self.selectAllTriggered else { return }
+
+            self.selectAllTriggered = true
+            self.longPressWorkItem = nil
+            self.releaseMouseAndSelectAll()
+        }
+        longPressWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + selectAllHoldDuration, execute: workItem)
+    }
+
+    private func releaseMouseAndSelectAll() {
+        guard let downLocation = leftMouseDownLocation,
+              let source = CGEventSource(stateID: .combinedSessionState),
+              let mouseUp = CGEvent(
+                mouseEventSource: source,
+                mouseType: .leftMouseUp,
+                mouseCursorPosition: CGEvent(source: nil)?.location ?? downLocation,
+                mouseButton: .left
+              ) else {
+            CopieActions.shared.performSelectAll()
+            return
+        }
+
+        suppressPhysicalLeftMouseUp = true
+        mouseSuppressionGeneration += 1
+        let suppressionGeneration = mouseSuppressionGeneration
+        leftMouseHeld = false
+        leftMouseDownLocation = nil
+        longPressGeneration += 1
+
+        mouseUp.setIntegerValueField(.eventSourceUserData, value: syntheticMouseEventTag)
+        mouseUp.post(tap: .cghidEventTap)
+
+        // Give the target app one run-loop turn to finish handling mouse-up.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) {
+            CopieActions.shared.performSelectAll()
+        }
+        monitorPhysicalMouseRelease(generation: suppressionGeneration)
+    }
+
+    private func monitorPhysicalMouseRelease(generation: Int) {
+        guard suppressPhysicalLeftMouseUp,
+              mouseSuppressionGeneration == generation else { return }
+
+        if !CGEventSource.buttonState(.hidSystemState, button: .left) {
+            clearPhysicalMouseSuppression()
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            self?.monitorPhysicalMouseRelease(generation: generation)
+        }
+    }
+
+    private func clearPhysicalMouseSuppression() {
+        suppressPhysicalLeftMouseUp = false
+        mouseSuppressionGeneration += 1
+        cancelSelectAll()
+        leftMouseHeld = false
+        leftMouseDownLocation = nil
+    }
+
+    private func cancelSelectAll() {
+        longPressWorkItem?.cancel()
+        longPressWorkItem = nil
+        longPressGeneration += 1
     }
 }
